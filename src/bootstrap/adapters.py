@@ -4,7 +4,7 @@
 PluginCommands，插件只依赖协议，不依赖容器类型。
 """
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
 from src.constants.constants import DeviceState, ListeningMode
@@ -68,6 +68,9 @@ class PluginCommandsAdapter:
     async def abort_speaking(self, reason: str) -> None:
         await self._container.session.abort_speaking(reason)
 
+    async def sync_audio_state(self) -> bool:
+        return await self._container.session.sync_audio_state()
+
     async def send_audio(self, data: bytes) -> None:
         await self._container.protocol.send_audio(data)
 
@@ -83,7 +86,7 @@ class PluginCommandsAdapter:
     async def connect_protocol(self) -> bool:
         return await self._container.session.connect_protocol()
 
-    def spawn(self, coro: Awaitable[Any], name: str) -> Any:
+    def spawn(self, coro: Coroutine[Any, Any, Any], name: str) -> Any:
         return self._container.tasks.spawn(coro, name)
 
     def schedule_command_nowait(self, fn: Callable, *args, **kwargs) -> None:

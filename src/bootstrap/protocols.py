@@ -3,7 +3,8 @@
 定义插件、窗口与核心服务之间的契约，实现松耦合。
 """
 
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Protocol
+from collections.abc import Awaitable, Callable, Coroutine
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from src.constants.constants import DeviceState, ListeningMode
@@ -94,6 +95,10 @@ class PluginCommands(Protocol):
         """
         ...
 
+    async def sync_audio_state(self) -> bool:
+        """上传前同步 AEC 可用性，返回当前帧是否允许发送。"""
+        ...
+
     async def send_audio(self, data: bytes) -> None:
         """
         发送音频数据.
@@ -124,10 +129,8 @@ class PluginCommands(Protocol):
         """
         ...
 
-    def spawn(self, coro: Awaitable[Any], name: str) -> Any:
-        """
-        创建异步任务.
-        """
+    def spawn(self, coro: Coroutine[Any, Any, Any], name: str) -> Any:
+        """接管新建原生协程；拒绝时负责关闭，不接受外部 Future/Task。"""
         ...
 
     def schedule_command_nowait(self, fn: Callable, *args, **kwargs) -> None:

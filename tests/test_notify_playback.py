@@ -19,6 +19,12 @@ class _FakeState:
     def is_idle(self):
         return self.device_state == DeviceState.IDLE
 
+    def should_capture_audio(self):
+        return self.device_state == DeviceState.LISTENING
+
+    def set_aec_enabled(self, enabled):
+        self.aec_enabled = enabled
+
     def set_listening_mode(self, mode):
         self.listening_mode = mode
 
@@ -31,6 +37,9 @@ class _FakeState:
 
 
 class _FakePlugins:
+    def get_plugin(self, _name):
+        return None
+
     async def notify_incoming_json(self, _message):
         return None
 
@@ -306,9 +315,9 @@ async def test_decode_failure_after_partial_audio_is_not_reported_as_success(
     generation = await player.start("https://example.test/a.ogg", [], on_finished)
     try:
         await _wait_for_pcm(codec, 1)
-        codec.progress_callback(240)
-        codec.drained_callback()
         assert await asyncio.wait_for(finished.get(), 1) == (generation, False)
+        assert codec.progress_callback is None
+        assert codec.drained_callback is None
         assert codec.clear_count == 1
     finally:
         await player.stop()
