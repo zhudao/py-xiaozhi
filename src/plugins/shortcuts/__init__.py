@@ -7,12 +7,11 @@
 
 import asyncio
 import sys
-from typing import TYPE_CHECKING, Callable, Dict, Optional
+from typing import TYPE_CHECKING
 
 from src.constants.constants import AbortReason
 from src.logging import get_logger
 from src.plugins.base import Plugin
-from src.utils.config_manager import get_config
 
 from .base import ShortcutBackend, ShortcutConfig
 
@@ -25,8 +24,8 @@ __all__ = ["ShortcutBackend", "ShortcutConfig", "ShortcutsPlugin", "create_backe
 
 
 def create_backend(
-    loop: Optional[asyncio.AbstractEventLoop] = None,
-) -> Optional[ShortcutBackend]:
+    loop: asyncio.AbstractEventLoop | None = None,
+) -> ShortcutBackend | None:
     """创建适合当前平台的快捷键后端.
 
     Args:
@@ -65,39 +64,10 @@ def create_backend(
             return None
 
 
-class _CmdAdapter:
-    """快捷键命令适配器."""
-
-    def __init__(self, cmd: "PluginCommands", ctx: "PluginContext"):
-        self._cmd = cmd
-        self._ctx = ctx
-
-    async def toggle_chat_state(self):
-        try:
-            await self._cmd.connect_protocol()
-            from src.constants.constants import ListeningMode
-
-            mode = (
-                ListeningMode.REALTIME
-                if self._ctx.get_config().get_config("AEC_OPTIONS.ENABLED", True)
-                else ListeningMode.AUTO_STOP
-            )
-            await self._cmd.start_listening(mode)
-        except Exception as e:
-            logger.error(f"切换对话状态失败: {e}", exc_info=True)
-
-    async def abort_speaking(self, reason):
-        try:
-            await self._cmd.abort_speaking(reason)
-        except Exception as e:
-            logger.error(f"中断对话失败: {e}", exc_info=True)
-
-
 class ShortcutsPlugin(Plugin):
     """快捷键插件."""
 
     name = "shortcuts"
-    priority = 70  # 最低优先级，依赖 UIPlugin
 
     # 快捷键名称常量
     MANUAL_PRESS = "MANUAL_PRESS"
@@ -108,17 +78,19 @@ class ShortcutsPlugin(Plugin):
 
     def __init__(self) -> None:
         super().__init__()
-        self._backend: Optional[ShortcutBackend] = None
-        self._adapter: Optional[_CmdAdapter] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._backend: ShortcutBackend | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._event_bus = None
-        self._config = get_config()
-        self._shortcuts_config: Dict = {}
+        self._config = None
+        self._shortcuts_config: dict = {}
         self._enabled = True
+        self._active = False
+        self._generation = 0
+        self._lifecycle_lock = asyncio.Lock()
 
     async def setup(self, ctx: "PluginContext", cmd: "PluginCommands") -> None:
         await super().setup(ctx, cmd)
-        self._adapter = _CmdAdapter(cmd, ctx)
+        self._config = ctx.get_config()
         self._loop = asyncio.get_running_loop()
         self._event_bus = ctx.event_bus
 
@@ -127,7 +99,9 @@ class ShortcutsPlugin(Plugin):
 
         # 创建后端
         self._backend = create_backend(self._loop)
-        if not self._backend:
+        if self._backend:
+            self._backend.bind_commands(cmd)
+        else:
             logger.warning("无法创建快捷键后端，快捷键功能将不可用")
 
         # 订阅配置变更事件
@@ -141,32 +115,38 @@ class ShortcutsPlugin(Plugin):
         self._enabled = bool(self._shortcuts_config.get("ENABLED", True))
 
     async def _on_config_changed(self, data=None) -> None:
-        """配置变更时重新加载."""
-        logger.info("ShortcutsPlugin: 收到配置变更事件，重新加载配置")
-        self.reload_from_config()
+        """配置变更时重新加载并协调监听状态。"""
+        if not self._active:
+            return
+        self._load_config()
+        self._generation += 1
+        await self._reconcile_backend()
 
     async def start(self) -> None:
-        """启动插件."""
-        if not self._enabled:
-            logger.info("快捷键功能已禁用")
-            return
+        """启动插件，包括初始禁用时的配置监听。"""
+        from src.core.event_bus import Events
 
-        if not self._backend:
-            logger.warning("快捷键后端不可用")
-            return
+        self._active = True
+        self._event_bus.on(Events.CONFIG_CHANGED, self._on_config_changed)
+        self._load_config()
+        await self._reconcile_backend()
 
-        # 注册快捷键
-        self._register_shortcuts()
-
-        # 启动后端
-        success = await self._backend.start()
-        if success:
-            logger.info("快捷键插件已启动")
-        else:
-            logger.error("快捷键后端启动失败")
+    async def _reconcile_backend(self) -> None:
+        async with self._lifecycle_lock:
+            if not self._active or not self._backend:
+                return
+            self._backend.unregister_all()
+            if not self._enabled:
+                await self._backend.stop()
+                logger.info("快捷键功能已禁用")
+                return
+            self._register_shortcuts()
+            if not self._backend.is_running:
+                if not await self._backend.start():
+                    logger.error("快捷键后端启动失败")
 
     def _register_shortcuts(self) -> None:
-        """注册所有快捷键."""
+        """注册所有快捷键。"""
         if not self._backend:
             return
 
@@ -178,6 +158,7 @@ class ShortcutsPlugin(Plugin):
             self.WINDOW_TOGGLE: self._handle_window_toggle,
         }
 
+        generation = self._generation
         for name, handler in shortcut_handlers.items():
             cfg = self._shortcuts_config.get(name, {}) or {}
             modifier = str(cfg.get("modifier", "ctrl")).lower()
@@ -192,82 +173,72 @@ class ShortcutsPlugin(Plugin):
                 description=cfg.get("description", ""),
             )
 
-            self._backend.register(name, config, handler)
+            async def guarded_handler(
+                handler=handler,
+                generation=generation,
+            ):
+                if (
+                    self._active
+                    and generation == self._generation
+                    and self._enabled
+                ):
+                    await handler()
 
-    def _handle_manual_press(self) -> None:
-        """处理手动按键快捷键 - 使用 UI_MANUAL_TOGGLE 事件."""
-        if not self._event_bus or not self._loop:
-            return
+            self._backend.register(name, config, guarded_handler)
 
+    async def _handle_manual_press(self) -> None:
+        """处理手动按键快捷键 - 使用 UI_MANUAL_TOGGLE 事件。"""
         from src.core.event_bus import Events
 
-        asyncio.run_coroutine_threadsafe(
-            self._event_bus.emit(Events.UI_MANUAL_TOGGLE), self._loop
-        )
+        await self._event_bus.emit(Events.UI_MANUAL_TOGGLE)
 
-    def _handle_auto_toggle(self) -> None:
-        """处理自动对话切换快捷键."""
-        if not self._adapter or not self._loop:
-            return
+    async def _handle_auto_toggle(self) -> None:
+        """处理自动对话切换快捷键。"""
+        await self.cmd.start_auto_conversation()
 
-        asyncio.run_coroutine_threadsafe(
-            self._adapter.toggle_chat_state(), self._loop
-        )
+    async def _handle_abort(self) -> None:
+        """处理中断快捷键。"""
+        await self.cmd.abort_speaking(AbortReason.NONE)
 
-    def _handle_abort(self) -> None:
-        """处理中断快捷键."""
-        if not self._adapter or not self._loop:
-            return
-
-        asyncio.run_coroutine_threadsafe(
-            self._adapter.abort_speaking(AbortReason.NONE), self._loop
-        )
-
-    def _handle_mode_toggle(self) -> None:
-        """处理模式切换快捷键."""
-        if not self._event_bus or not self._loop:
-            return
-
+    async def _handle_mode_toggle(self) -> None:
+        """处理模式切换快捷键。"""
         from src.core.event_bus import Events
 
-        asyncio.run_coroutine_threadsafe(
-            self._event_bus.emit(Events.UI_AUTO_TOGGLE), self._loop
-        )
+        await self._event_bus.emit(Events.UI_AUTO_TOGGLE)
 
-    def _handle_window_toggle(self) -> None:
-        """处理窗口切换快捷键."""
-        if not self._event_bus or not self._loop:
-            return
-
+    async def _handle_window_toggle(self) -> None:
+        """处理窗口切换快捷键。"""
         from src.core.event_bus import Events
 
-        asyncio.run_coroutine_threadsafe(
-            self._event_bus.emit(Events.UI_TOGGLE_WINDOW), self._loop
-        )
+        await self._event_bus.emit(Events.UI_TOGGLE_WINDOW)
 
     async def stop(self) -> None:
-        """停止插件."""
-        if self._backend:
-            await self._backend.stop()
+        """先撤销回调许可和配置订阅，再停止监听。"""
+        from src.core.event_bus import Events
+
+        self._active = False
+        self._generation += 1
+        if self._event_bus:
+            self._event_bus.off(Events.CONFIG_CHANGED, self._on_config_changed)
+        async with self._lifecycle_lock:
+            if self._backend:
+                self._backend.unregister_all()
+                await self._backend.stop()
 
     def register_resources(self, pool) -> None:
-        backend = self._backend
-        if backend:
-            pool.register("shortcuts.backend", backend.stop)
+        if self._backend:
+            pool.register("shortcuts.backend", self.stop)
 
     def reload_from_config(self) -> None:
-        """从配置重新加载."""
-        self._load_config()
-
-        if not self._backend:
+        """从同步调用入口调度受管的配置协调任务。"""
+        if not self._active:
             return
+        self._load_config()
+        self._generation += 1
+        generation = self._generation
 
-        # 注销所有快捷键
-        self._backend.unregister_all()
+        async def reconcile():
+            if self._active and generation == self._generation:
+                await self._reconcile_backend()
 
-        if self._enabled:
-            # 重新注册
-            self._register_shortcuts()
-            logger.info("快捷键配置已重新加载")
-        else:
-            logger.info("快捷键功能已禁用")
+        self.cmd.schedule_command_nowait(reconcile)

@@ -4,7 +4,8 @@ import os
 import shutil
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any
 
 from src.logging import get_logger
 from src.utils.resource_finder import (
@@ -40,9 +41,7 @@ def get_config() -> "ConfigManager":
         RuntimeError: 尚未 initialize_config()
     """
     if _current is None:
-        raise RuntimeError(
-            "ConfigManager 未初始化：请在入口调用 initialize_config()"
-        )
+        raise RuntimeError("ConfigManager 未初始化：请在入口调用 initialize_config()")
     return _current
 
 
@@ -193,10 +192,35 @@ class ConfigManager:
         },
     }
 
-    def __init__(self):
-        """初始化配置管理器（直接构造；应用请用 initialize_config）."""
-        self._init_config_paths()
-        self._config = self._load_config()
+    def __init__(
+        self, config_file: str | Path | None = None, *, data: dict | None = None
+    ):
+        """Create a file-backed configuration, or an isolated in-memory one.
+
+        The application may keep using its default user configuration. Embedded
+        clients use ``from_dict`` or an explicit file without changing that default.
+        """
+        self._memory_only = data is not None
+        if self._memory_only:
+            if config_file is not None:
+                raise ValueError("data and config_file are mutually exclusive")
+            self.config_dir = None
+            self.config_file = None
+            self._config = self._merge_configs(
+                self._default_config_copy(), copy.deepcopy(data)
+            )
+        elif config_file is not None:
+            self.config_file = Path(config_file)
+            self.config_dir = self.config_file.parent
+            self._config = self._load_config()
+        else:
+            self._init_config_paths()
+            self._config = self._load_config()
+
+    @classmethod
+    def from_dict(cls, data: dict | None = None) -> "ConfigManager":
+        """Return independent defaults plus overrides, with no filesystem I/O."""
+        return cls(data={} if data is None else data)
 
     def _init_config_paths(self):
         """
@@ -229,12 +253,12 @@ class ConfigManager:
         logger.info(f"配置目录: {self.config_dir.absolute()}")
         logger.info(f"配置文件: {self.config_file.absolute()}")
 
-    def _default_config_copy(self) -> Dict[str, Any]:
+    def _default_config_copy(self) -> dict[str, Any]:
         """深拷贝默认配置，避免实例与类属性共享嵌套 dict/list."""
         return copy.deepcopy(self.DEFAULT_CONFIG)
 
-    def _load_config(self) -> Dict[str, Any]:
-        """加载配置文件；不存在则创建；损坏则备份后回退默认."""
+    def _load_config(self, *, strict: bool = False) -> dict[str, Any]:
+        """加载配置；启动时允许默认恢复，严格模式将读取错误交给提交方。"""
         try:
             if self.config_file.exists():
                 logger.debug(f"找到配置文件: {self.config_file}")
@@ -242,6 +266,8 @@ class ConfigManager:
                     raw = self.config_file.read_text(encoding="utf-8")
                     config = json.loads(raw)
                 except Exception as e:
+                    if strict:
+                        raise
                     backup = self._backup_corrupt_config(e)
                     logger.error(
                         "配置文件损坏，已备份%s并回退默认: %s",
@@ -254,6 +280,8 @@ class ConfigManager:
                     return defaults
 
                 if not isinstance(config, dict):
+                    if strict:
+                        raise TypeError("配置根节点须为 object")
                     backup = self._backup_corrupt_config(
                         TypeError(f"根节点须为 object，实际为 {type(config).__name__}")
                     )
@@ -273,18 +301,22 @@ class ConfigManager:
                     file_ver = 0
                 return self._migrate_config(merged, from_version=file_ver)
 
+            if strict:
+                raise FileNotFoundError(self.config_file)
             logger.info("配置文件不存在，创建默认配置")
             defaults = self._default_config_copy()
             self._save_config(defaults)
             return defaults
 
         except Exception as e:
+            if strict:
+                raise
             logger.error(f"配置加载错误: {e}", exc_info=True)
             return self._default_config_copy()
 
     def _migrate_config(
-        self, config: Dict[str, Any], *, from_version: int | None = None
-    ) -> Dict[str, Any]:
+        self, config: dict[str, Any], *, from_version: int | None = None
+    ) -> dict[str, Any]:
         """按 CONFIG_VERSION 做向前迁移；必要时写回磁盘.
 
         from_version: 磁盘文件中的版本（merge 前）。若省略则读 config 内字段
@@ -330,9 +362,7 @@ class ConfigManager:
         if ver != original or config.get("CONFIG_VERSION") != self.CONFIG_VERSION:
             config["CONFIG_VERSION"] = self.CONFIG_VERSION
             if self._save_config(config):
-                logger.info(
-                    "配置已迁移: v%s -> v%s", original, self.CONFIG_VERSION
-                )
+                logger.info("配置已迁移: v%s -> v%s", original, self.CONFIG_VERSION)
             else:
                 logger.warning(
                     "配置迁移后写回失败（内存已是 v%s）", self.CONFIG_VERSION
@@ -361,7 +391,9 @@ class ConfigManager:
             return None
 
     def _save_config(self, config: dict) -> bool:
-        """原子写入配置文件（临时文件 + rename 防写入中断损坏）."""
+        """原子写入配置文件；内存配置只更新当前实例。"""
+        if getattr(self, "_memory_only", False):
+            return True
         try:
             self.config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -398,8 +430,11 @@ class ConfigManager:
     def get_config(self, path: str, default: Any = None) -> Any:
         """
         通过路径获取配置值
-        path: 点分隔的配置路径，如 "SYSTEM_OPTIONS.NETWORK.MQTT_INFO"
+        path: 点分隔的配置路径，如 "SYSTEM_OPTIONS.NETWORK.MQTT_INFO"。
+        空路径返回完整配置的深拷贝，供设置编辑器保存未提交的修改。
         """
+        if path == "":
+            return copy.deepcopy(self._config)
         try:
             value = self._config
             for key in path.split("."):
@@ -440,7 +475,7 @@ class ConfigManager:
             logger.error(f"配置更新错误 {path}: {e}", exc_info=True)
             return False
 
-    def update_configs(self, updates: Dict[str, Any]) -> bool:
+    def update_configs(self, updates: dict[str, Any]) -> bool:
         """批量更新多个配置路径，只写盘一次.
 
         Args:
@@ -458,27 +493,67 @@ class ConfigManager:
             logger.error(f"批量配置更新错误: {e}", exc_info=True)
             return False
 
+    def commit_draft(self, draft: dict) -> str | None:
+        """提交独立草稿；成功返回 None，失败返回可展示的错误信息.
+
+        文件配置先原子写盘，再加载运行时配置；加载失败时仅恢复运行时，
+        保留已经写入的磁盘内容。提交不会应用 PATHS 覆盖或迁移目录。
+        """
+        memory_only = getattr(self, "_memory_only", False)
+        try:
+            candidate = copy.deepcopy(draft)
+            previous = None if memory_only else copy.deepcopy(self._config)
+        except Exception as e:
+            logger.error("配置草稿复制失败: %s", e, exc_info=True)
+            return f"配置草稿复制失败: {e}"
+
+        if memory_only:
+            self._config = candidate
+            return None
+
+        try:
+            if not self._save_config(candidate):
+                return "保存配置失败，请检查文件权限和磁盘空间"
+        except Exception as e:
+            logger.error("保存配置失败: %s", e, exc_info=True)
+            return f"保存配置失败: {e}"
+
+        try:
+            if self.reload_config(apply_paths=False, strict=True):
+                return None
+        except Exception as e:
+            logger.error("草稿写入后运行时加载失败: %s", e, exc_info=True)
+            self._config = previous
+            return f"配置已写入，但运行时加载失败: {e}"
+        self._config = previous
+        return "配置已写入，但运行时加载失败，请重试或重启应用"
+
     def save_config(self) -> bool:
         """将当前内存配置落盘."""
         return self._save_config(self._config)
 
-    def reload_config(self, *, apply_paths: bool = True) -> bool:
+    def reload_config(
+        self, *, apply_paths: bool = True, strict: bool = False
+    ) -> bool:
         """重新加载配置文件.
 
         apply_paths: 是否重新应用 PATHS 覆盖（不迁移目录）。
+        strict: 读取失败时不备份或覆盖为默认配置。
         PATHS 目录迁移仅在 initialize_config 时执行。
         """
+        if getattr(self, "_memory_only", False):
+            return True
         try:
-            self._config = self._load_config()
+            self._config = self._load_config(strict=strict)
             if apply_paths:
                 try:
-                    from src.utils.resource_finder import apply_path_overrides_from_config
+                    from src.utils.resource_finder import (
+                        apply_path_overrides_from_config,
+                    )
 
                     apply_path_overrides_from_config(self, migrate=False)
                 except Exception as e:
-                    logger.warning(
-                        "reload 后应用 PATHS 失败: %s", e, exc_info=True
-                    )
+                    logger.warning("reload 后应用 PATHS 失败: %s", e, exc_info=True)
             logger.info("配置文件已重新加载")
             return True
         except Exception as e:
