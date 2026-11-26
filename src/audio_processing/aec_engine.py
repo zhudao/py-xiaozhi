@@ -19,6 +19,7 @@ import ctypes
 import sys
 import threading
 from collections import deque
+from typing import Protocol
 
 import numpy as np
 
@@ -31,6 +32,83 @@ _MAX_CONSECUTIVE_FAILURES = 5
 # far 待处理队列上限（输出回调块数，约 20ms/块 → 0.5s）；
 # 采集线程停转时防堆积，超限丢最旧
 _FAR_PENDING_MAX_BLOCKS = 25
+
+
+class FarEndSource(Protocol):
+    """AEC 远端参考源协议（支持 SelfFar 与未来跨平台 SystemLoopback 扩展）."""
+
+    def feed_self_output(self, outdata: np.ndarray) -> None:
+        """接收本进程输出回调的最终 PCM（系统回环实现可忽略）."""
+        ...
+
+    def drain_16k(self) -> np.ndarray:
+        """在采集线程中排空并重采样为 16kHz 单声道 float32 参考样本."""
+        ...
+
+    def close(self) -> None:
+        """释放远端采集/重采样资源."""
+        ...
+
+
+class SelfFarEndSource:
+    """默认远端参考源：来自本进程 AudioCodec 输出回调的混合 PCM."""
+
+    def __init__(self, *, far_rate: int, target_rate: int) -> None:
+        self._far_rate = int(far_rate)
+        self._target_rate = int(target_rate)
+        self._pending: deque[np.ndarray] = deque()
+        self._resampler = None
+        self._dropped = 0
+        self._error_logged = False
+        if self._far_rate != self._target_rate:
+            import soxr
+
+            self._resampler = soxr.ResampleStream(
+                self._far_rate,
+                self._target_rate,
+                num_channels=1,
+                dtype="float32",
+                quality="QQ",
+            )
+
+    def feed_self_output(self, outdata: np.ndarray) -> None:
+        try:
+            if outdata.ndim > 1 and outdata.shape[1] > 1:
+                mono = outdata.mean(axis=1, dtype=np.float32)
+            else:
+                # PortAudio 复用 outdata 内存，必须拷贝
+                mono = np.array(outdata, dtype=np.float32).ravel()
+
+            self._pending.append(mono)
+            # deque 操作在 GIL 下原子；超限丢最旧（采集线程停转时防堆积）
+            while len(self._pending) > _FAR_PENDING_MAX_BLOCKS:
+                self._pending.popleft()
+                self._dropped += 1
+        except Exception as exc:
+            self._dropped += 1
+            if not self._error_logged:
+                self._error_logged = True
+                logger.warning("AEC feed_far 异常（后续同类错误静默计数）: %s", exc)
+
+    def drain_16k(self) -> np.ndarray:
+        chunks: list[np.ndarray] = []
+        while self._pending:
+            mono = self._pending.popleft()
+            if self._resampler is not None:
+                mono = self._resampler.resample_chunk(mono, last=False)
+            if len(mono):
+                chunks.append(mono)
+        if not chunks:
+            return np.empty(0, dtype=np.float32)
+        if len(chunks) == 1:
+            return chunks[0]
+        return np.concatenate(chunks)
+
+    def close(self) -> None:
+        self._resampler = None
+        self._pending.clear()
+        if self._dropped:
+            logger.debug(f"AEC far 累计丢弃 {self._dropped} 块")
 
 
 def _import_webrtc_apm():
@@ -59,6 +137,8 @@ class AecEngine:
         far_rate: int = 48000,
         delay_ms: int = 60,
         enable_preprocess: bool = True,
+        far_end_source: FarEndSource | None = None,
+        near_delay_ms: int = 0,
     ):
         """初始化并加载 APM；失败时 active=False（旁路）.
 
@@ -67,11 +147,20 @@ class AecEngine:
             far_rate: 设备输出采样率（far 侧重采样源）
             delay_ms: 播放到采集的估计延迟
             enable_preprocess: 是否同时开高通+噪声抑制
+            far_end_source: 可选自定义远端参考源（默认 SelfFarEndSource）
+            near_delay_ms: 近端因果对齐缓冲时长（ms）；系统回环采集晚于麦克风时用于保证因果
         """
         self._near_rate = int(near_rate)
         self._far_rate = int(far_rate)
         self._delay_ms = int(delay_ms)
         self._frame = self._near_rate // 100  # 10ms
+        self._near_delay_samples = max(0, (int(near_delay_ms) // 10) * self._frame)
+        self._near_delay_fifo = (
+            np.zeros(self._near_delay_samples, dtype=np.float32)
+            if self._near_delay_samples > 0
+            else None
+        )
+        self._first_near_call = True
         self._lock = threading.Lock()
         self._active = False
         self._closed = False
@@ -80,12 +169,8 @@ class AecEngine:
 
         self._apm = None
         self._stream_cfg = None
-        # far 两级缓冲：pending 由输出回调写入（仅拷贝），
-        # buffer 为采集线程重采样后的 16k 样本余量
-        self._far_pending: deque = deque()
+        self._far_end: FarEndSource | None = None
         self._far_buffer = np.empty(0, dtype=np.float32)
-        self._far_resampler = None
-        self._far_dropped = 0
 
         # 复用的 ctypes 帧缓冲（10ms int16）
         self._near_in = (ctypes.c_short * self._frame)()
@@ -95,21 +180,21 @@ class AecEngine:
 
         try:
             self._init_apm(enable_preprocess)
-            if self._far_rate != self._near_rate:
-                import soxr
-
-                self._far_resampler = soxr.ResampleStream(
-                    self._far_rate,
-                    self._near_rate,
-                    num_channels=1,
-                    dtype="float32",
-                    quality="QQ",
+            self._far_end = (
+                far_end_source
+                if far_end_source is not None
+                else SelfFarEndSource(
+                    far_rate=self._far_rate, target_rate=self._near_rate
                 )
+            )
             self._active = True
+            far_mode = getattr(self._far_end, "mode", "self")
             logger.info(
                 f"AEC 引擎已启用 | near {self._near_rate}Hz, "
                 f"far {self._far_rate}Hz→{self._near_rate}Hz, "
-                f"delay {self._delay_ms}ms, preprocess={enable_preprocess}"
+                f"ref={far_mode}, delay {self._delay_ms}ms, "
+                f"near_delay {self._near_delay_samples // self._frame * 10}ms, "
+                f"preprocess={enable_preprocess}"
             )
         except Exception as e:
             logger.warning(f"AEC 引擎初始化失败，已旁路: {e}")
@@ -141,6 +226,13 @@ class AecEngine:
     def active(self) -> bool:
         return self._active
 
+    @property
+    def far_end_mode(self) -> str:
+        """当前实际生效的远端参考模式（'self' / 'system' / 'self_fallback' / 'off'）."""
+        if not self._active or self._far_end is None:
+            return "off"
+        return str(getattr(self._far_end, "mode", "self"))
+
     def process_near(self, block: np.ndarray) -> np.ndarray:
         """处理采集帧（16kHz 单声道 float32），返回消回声后的同长数据.
 
@@ -157,16 +249,26 @@ class AecEngine:
             return block
 
         try:
-            i16 = self._float_to_i16(block)
-            out = np.empty(n, dtype=np.float32)
-
             with self._lock:
                 if not self._active:
                     return block
-                # far 先于 near：排空输出回调攒下的参考数据，保持因果
-                self._drain_far_locked()
+                # 1. 拉取远端参考样本；首次进入采集回调时裁掉启动前积压的陈旧预热样本
+                self._pull_far_locked(block_samples=n)
+
+                # 2. 系统回环模式下通过近端因果 FIFO 补偿 OS 回环晚于麦克风的负延迟
+                near_block = block
+                if self._near_delay_fifo is not None:
+                    combined = np.concatenate((self._near_delay_fifo, block))
+                    near_block = combined[:n]
+                    self._near_delay_fifo = combined[n:]
+
+                i16 = self._float_to_i16(near_block)
+                out = np.empty(n, dtype=np.float32)
+
+                # 3. 逐 10ms 交替喂入 far -> near（1:1 交织），消除长帧块（如 60ms）的突发锯齿
                 self._apm.set_stream_delay_ms(self._delay_ms)
                 for off in range(0, n, self._frame):
+                    self._feed_one_far_frame_locked()
                     ctypes.memmove(
                         self._near_in,
                         i16[off : off + self._frame].ctypes.data,
@@ -182,6 +284,10 @@ class AecEngine:
                         / 32768.0
                     )
 
+                # 若远端仍有明显富余（>=40ms 且超过当前块），追平 1 帧防止跨时钟长期堆积
+                if len(self._far_buffer) >= max(n, self._frame * 4):
+                    self._feed_one_far_frame_locked()
+
             self._fail_count = 0
             return out
         except Exception as e:
@@ -189,57 +295,45 @@ class AecEngine:
             return block
 
     def feed_far(self, outdata: np.ndarray) -> None:
-        """输出回调线程调用：仅下混+拷贝入队，不做重采样/APM（微秒级返回）.
-
-        含静音帧也应喂入，保持 far 流连续；重活由采集线程 process_near 完成。
-        """
-        if not self._active:
+        """输出回调线程调用：投递本进程最终输出 PCM 给远端参考源."""
+        if not self._active or self._far_end is None:
             return
+        self._far_end.feed_self_output(outdata)
 
-        try:
-            if outdata.ndim > 1 and outdata.shape[1] > 1:
-                mono = outdata.mean(axis=1, dtype=np.float32)
-            else:
-                # PortAudio 复用 outdata 内存，必须拷贝
-                mono = np.array(outdata, dtype=np.float32).ravel()
+    def _pull_far_locked(self, *, block_samples: int) -> None:
+        """采集线程（已持锁）：从远端参考源拉取最新 16kHz 样本并保持队列有界."""
+        if self._far_end is not None:
+            fresh = self._far_end.drain_16k()
+            if self._first_near_call:
+                self._first_near_call = False
+                # 启动阶段音频流尚未开启时，系统回环可能已攒下数百毫秒静音；只保留最近 1 块
+                if len(fresh) > block_samples:
+                    fresh = fresh[-block_samples:]
+            if len(fresh):
+                self._far_buffer = (
+                    fresh
+                    if not len(self._far_buffer)
+                    else np.concatenate((self._far_buffer, fresh))
+                )
 
-            self._far_pending.append(mono)
-            # deque 操作在 GIL 下原子；超限丢最旧（采集线程停转时防堆积）
-            while len(self._far_pending) > _FAR_PENDING_MAX_BLOCKS:
-                self._far_pending.popleft()
-                self._far_dropped += 1
-        except Exception:
-            pass  # 输出路径绝不抛
+        # 上限保护（约 2.5 个采集块，至少 160ms）：防止跨时钟漂移造成延迟累积
+        max_keep = max(block_samples * 2 + self._frame * 4, self._frame * 16)
+        if len(self._far_buffer) > max_keep:
+            self._far_buffer = self._far_buffer[-max_keep:]
 
-    def _drain_far_locked(self) -> None:
-        """采集线程（已持锁）：重采样 far 队列并喂给 ProcessReverseStream."""
-        while self._far_pending:
-            mono = self._far_pending.popleft()
-            if self._far_resampler is not None:
-                mono = self._far_resampler.resample_chunk(mono, last=False)
-            if len(mono):
-                self._far_buffer = np.concatenate((self._far_buffer, mono))
-
-        n_frames = len(self._far_buffer) // self._frame
-        if n_frames == 0:
+    def _feed_one_far_frame_locked(self) -> None:
+        """采集线程（已持锁）：从远端缓冲取出 1 帧（10ms）送入 ProcessReverseStream."""
+        if len(self._far_buffer) < self._frame:
             return
-
-        usable = n_frames * self._frame
-        i16 = self._float_to_i16(self._far_buffer[:usable])
-        self._far_buffer = self._far_buffer[usable:]
-
-        for off in range(0, usable, self._frame):
-            ctypes.memmove(
-                self._far_in, i16[off : off + self._frame].ctypes.data, self._frame * 2
-            )
-            ret = self._apm.process_reverse_stream(
-                self._far_in, self._stream_cfg, self._stream_cfg, self._far_out
-            )
-            if ret != 0:
-                raise RuntimeError(f"process_reverse_stream 返回 {ret}")
-
-    def set_delay_ms(self, delay_ms: int) -> None:
-        self._delay_ms = int(delay_ms)
+        frame_f32 = self._far_buffer[: self._frame]
+        self._far_buffer = self._far_buffer[self._frame :]
+        i16 = self._float_to_i16(frame_f32)
+        ctypes.memmove(self._far_in, i16.ctypes.data, self._frame * 2)
+        ret = self._apm.process_reverse_stream(
+            self._far_in, self._stream_cfg, self._stream_cfg, self._far_out
+        )
+        if ret != 0:
+            raise RuntimeError(f"process_reverse_stream 返回 {ret}")
 
     def close(self) -> None:
         """释放 APM 资源；须在音频流停止后调用."""
@@ -260,11 +354,13 @@ class AecEngine:
             pass
         self._stream_cfg = None
         self._apm = None
-        self._far_resampler = None
-        self._far_pending.clear()
+        if self._far_end is not None:
+            try:
+                self._far_end.close()
+            except Exception:
+                pass
+            self._far_end = None
         self._far_buffer = np.empty(0, dtype=np.float32)
-        if self._far_dropped:
-            logger.debug(f"AEC far 累计丢弃 {self._far_dropped} 块")
 
     def _on_failure(self, side: str, err: Exception) -> None:
         self._fail_count += 1
